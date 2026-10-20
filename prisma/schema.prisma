@@ -1,1 +1,225 @@
+// UofR Event Parking — database schema
+// Auth tables (user, session, account, verification) follow Better Auth's core schema;
+// Phase 4 confirms them against Better Auth's own schema validation.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum RequestStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  CHANGES_REQUESTED
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+// ───────────── Auth + people ─────────────
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // App fields. Plain strings (not enums) so Better Auth can write them;
+  // allowed values live in src/lib/constants.ts and are enforced on the server.
+  role             String    @default("ORGANIZER") // ORGANIZER | STAFF | ADMIN
+  status           String    @default("ACTIVE")    // ACTIVE | PENDING_APPROVAL | REJECTED | DEACTIVATED
+  organizationName String?
+  phone            String?
+  approvedById     String?
+  approvedAt       DateTime?
+  decisionNote     String?
+
+  approvedBy      User?  @relation("StaffApproval", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedStaff   User[] @relation("StaffApproval")
+
+  sessions        Session[]
+  accounts        Account[]
+  requests        ParkingRequest[] @relation("RequestOrganizer")
+  processed       ParkingRequest[] @relation("RequestProcessor")
+  directoryAdded  StaffDirectoryEntry[] @relation("DirectoryAddedBy")
+  directoryClaim  StaffDirectoryEntry?  @relation("DirectoryClaimedBy")
+  auditEntries    AuditLog[]
+  notifications   Notification[]
+
+  @@index([role, status])
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+// Pre-approved staff emails (Door A). Emails are stored lowercase.
+model StaffDirectoryEntry {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  role            String    @default("STAFF") // STAFF | ADMIN
+  addedById       String
+  addedBy         User      @relation("DirectoryAddedBy", fields: [addedById], references: [id])
+  addedAt         DateTime  @default(now())
+  claimedByUserId String?   @unique
+  claimedBy       User?     @relation("DirectoryClaimedBy", fields: [claimedByUserId], references: [id], onDelete: SetNull)
+  claimedAt       DateTime?
+
+  @@map("staff_directory")
+}
+
+// ───────────── Parking domain ─────────────
+
+model ParkingLot {
+  id                  String   @id @default(cuid())
+  name                String   @unique
+  totalSpots          Int
+  eventSpotsAvailable Int      // spots that can be given to events (<= totalSpots)
+  isActive            Boolean  @default(true)
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  requests    ParkingRequest[]
+  allocations RequestAllocation[]
+
+  @@map("parking_lot")
+}
+
+model ParkingRequest {
+  id    String @id @default(cuid())
+  // Source of truth for the public reference (UPR-<year>-<seq>); see src/lib/reference.ts
+  refSeq Int   @unique @default(autoincrement())
+
+  organizerId String
+  organizer   User   @relation("RequestOrganizer", fields: [organizerId], references: [id])
+
+  eventName             String
+  description           String?
+  eventStart            DateTime
+  eventEnd              DateTime
+  spotsRequested        Int
+  accessibleSpotsNeeded Int      @default(0)
+  preferredLotId        String?
+  preferredLot          ParkingLot? @relation(fields: [preferredLotId], references: [id], onDelete: SetNull)
+  contactName           String
+  contactPhone          String
+  notes                 String?
+
+  status      RequestStatus @default(SUBMITTED)
+  adminNote   String?
+  // Incremented on every change; edits and admin actions must match the version they read.
+  version     Int           @default(1)
+  submittedAt DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  processedAt DateTime?
+  processedById String?
+  processedBy User?         @relation("RequestProcessor", fields: [processedById], references: [id], onDelete: SetNull)
+
+  allocations   RequestAllocation[]
+  notifications Notification[]
+
+  @@index([organizerId, status])
+  @@index([status, eventStart])
+  @@map("parking_request")
+}
+
+model RequestAllocation {
+  id        String   @id @default(cuid())
+  requestId String
+  request   ParkingRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  lotId     String
+  lot       ParkingLot     @relation(fields: [lotId], references: [id])
+  spots     Int
+  startsAt  DateTime
+  endsAt    DateTime
+
+  @@index([lotId, startsAt, endsAt])
+  @@index([requestId])
+  @@map("request_allocation")
+}
+
+// ───────────── Cross-cutting ─────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action     String   // e.g. REQUEST_EDITED, REQUEST_APPROVED, STAFF_APPROVED
+  entityType String
+  entityId   String
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestId String?
+  request   ParkingRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  type      String
+  status    String   @default("PENDING") // PENDING | SENT | FAILED
+  error     String?
+  createdAt DateTime @default(now())
+  sentAt    DateTime?
+
+  @@index([userId])
+  @@map("notification")
+}
 
