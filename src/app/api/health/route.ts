@@ -19,7 +19,16 @@ export async function GET() {
     await getDb().$queryRaw`SELECT 1`;
     return NextResponse.json({ status: "ok" });
   } catch (error) {
-    console.error("Health check failed:", error);
+    // Server-side only (Vercel Logs): enough detail to diagnose, never sent to the visitor.
+    const e = error as { name?: string; code?: string; message?: string; cause?: { code?: string; message?: string }; meta?: unknown };
+    console.error("Health check failed:", {
+      name: e?.name,
+      code: e?.code,
+      message: e?.message,
+      causeCode: e?.cause?.code,
+      causeMessage: e?.cause?.message,
+      meta: e?.meta,
+    });
     return NextResponse.json({ status: "database_unavailable", reason: "connection_failed" }, { status: 503 });
   }
 }
